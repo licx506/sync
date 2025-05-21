@@ -11,27 +11,36 @@ import time
 import socket
 import json
 import sqlite3
+import os
 from pathlib import Path
 
-from config import DEFAULT_PORT, DEFAULT_BUFFER_SIZE, DEFAULT_TIME_THRESHOLD, DEFAULT_SIZE_THRESHOLD, logger
+from config import (
+    DEFAULT_PORT, DEFAULT_BUFFER_SIZE, DEFAULT_TIME_THRESHOLD, DEFAULT_SIZE_THRESHOLD, 
+    logger, load_exclude_config, EXCLUDED_EXTENSIONS, EXCLUDED_DIRECTORIES, EXCLUDED_PATHS
+)
 from database import FileDatabase
 from utils import calculate_file_hash, send_data, receive_data, parse_json_response
 
 class SyncClient:
     """同步客户端"""
 
-    def __init__(self, server_ip, port=DEFAULT_PORT):
+    def __init__(self, server_ip, port=DEFAULT_PORT, exclude_config='exclude.conf'):
         """初始化客户端
 
         Args:
             server_ip: 服务端IP地址
             port: 服务端端口
+            exclude_config: 排除配置文件路径
         """
         self.server_ip = server_ip
         self.port = port
 
         # 获取当前脚本所在目录
         self.script_dir = Path(__file__).resolve().parent
+
+        # 加载排除规则
+        self.excluded_extensions, self.excluded_directories, self.excluded_paths = load_exclude_config(exclude_config)
+        logger.info(f"已加载排除规则: {len(self.excluded_extensions)} 个扩展名, {len(self.excluded_directories)} 个目录, {len(self.excluded_paths)} 个路径")
 
         # 初始化数据库
         self.db = FileDatabase(self.script_dir / "file_sync_client.db")
@@ -56,7 +65,7 @@ class SyncClient:
         client_socket = None
         max_retries = 3  # 最大重试次数
         retry_count = 0
-
+        
         try:
             while retry_count < max_retries:
                 try:
@@ -66,7 +75,7 @@ class SyncClient:
                             client_socket.close()
                         except:
                             pass
-
+                    
                     # 创建新的socket连接
                     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     client_socket.connect((self.server_ip, self.port))
@@ -89,10 +98,10 @@ class SyncClient:
 
                     # 同步文件
                     self.sync_files(client_socket, files_to_sync)
-
+                    
                     # 如果成功完成，跳出循环
                     break
-
+                    
                 except ConnectionRefusedError:
                     retry_count += 1
                     logger.error(f"无法连接到服务端: {self.server_ip}:{self.port}")
@@ -159,7 +168,7 @@ class SyncClient:
         if not response_data:
             logger.error("时间同步失败: 未收到响应数据")
             return 0
-
+            
         try:
             response = json.loads(response_data)
         except json.JSONDecodeError as e:
@@ -197,7 +206,7 @@ class SyncClient:
             if not response_data:
                 logger.error("数据库下载请求失败: 未收到响应数据")
                 return None
-
+                
             try:
                 response = json.loads(response_data)
             except json.JSONDecodeError as e:
@@ -219,32 +228,32 @@ class SyncClient:
             # 接收数据库文件
             logger.info("开始接收数据库文件...")
             server_db_path = self.script_dir / "server_file_sync.db"
-
+            
             # 设置socket超时
             original_timeout = client_socket.gettimeout()
             client_socket.settimeout(30)  # 设置30秒超时
-
+            
             try:
                 with open(server_db_path, 'wb') as f:
                     received_size = 0
                     last_log_time = time.time()
-
+                    
                     while received_size < file_size:
                         try:
                             chunk = client_socket.recv(min(DEFAULT_BUFFER_SIZE, file_size - received_size))
                             if not chunk:
                                 logger.warning("接收数据库文件时连接关闭")
                                 break
-
+                                
                             f.write(chunk)
                             received_size += len(chunk)
-
+                            
                             # 每秒记录一次进度
                             current_time = time.time()
                             if current_time - last_log_time >= 1:
                                 logger.info(f"已接收 {received_size}/{file_size} 字节 ({received_size/file_size*100:.1f}%)")
                                 last_log_time = current_time
-
+                                
                         except socket.timeout:
                             logger.warning("接收数据库文件时超时")
                             break
@@ -264,10 +273,41 @@ class SyncClient:
 
             logger.info(f"数据库文件下载完成，大小: {received_size} 字节")
             return server_db_path
-
+            
         except Exception as e:
             logger.error(f"下载服务端数据库时发生错误: {str(e)}")
             return None
+            
+    def should_exclude_file(self, path):
+        """检查文件是否应该被排除
+        
+        Args:
+            path: 文件相对路径
+            
+        Returns:
+            如果文件应该被排除，返回True，否则返回False
+        """
+        # 检查特定路径
+        str_path = str(path)
+        for excluded_path in self.excluded_paths:
+            if str_path == excluded_path or str_path.startswith(excluded_path + '/'):
+                logger.debug(f"排除文件(路径匹配): {path}")
+                return True
+        
+        # 检查文件扩展名
+        suffix = Path(path).suffix.lower()
+        if suffix in self.excluded_extensions:
+            logger.debug(f"排除文件(扩展名匹配): {path}")
+            return True
+        
+        # 检查目录名
+        parts = Path(path).parts
+        for part in parts:
+            if part in self.excluded_directories:
+                logger.debug(f"排除文件(目录匹配): {path}")
+                return True
+        
+        return False
 
     def compare_files(self, server_db_path):
         """对比文件清单，找出需要同步的文件
@@ -307,9 +347,15 @@ class SyncClient:
         # 找出需要同步的文件
         files_to_sync = []
         parent_dir = self.script_dir.parent
+        excluded_count = 0
 
         # 遍历客户端文件
         for path, client_file in client_files.items():
+            # 检查文件是否应该被排除
+            if self.should_exclude_file(path):
+                excluded_count += 1
+                continue
+                
             server_file = server_files.get(path)
 
             # 如果服务端没有该文件，或者文件大小不同，或者修改时间差异超过阈值
@@ -336,7 +382,7 @@ class SyncClient:
                     })
 
         server_db.close()
-        logger.info(f"文件对比完成，需要同步 {len(files_to_sync)} 个文件")
+        logger.info(f"文件对比完成，需要同步 {len(files_to_sync)} 个文件，排除 {excluded_count} 个文件")
         return files_to_sync
 
     def sync_files(self, client_socket, files_to_sync):
@@ -362,7 +408,7 @@ class SyncClient:
         if not response_data:
             logger.error("文件同步失败: 未收到服务端响应")
             return
-
+            
         try:
             response = json.loads(response_data)
         except json.JSONDecodeError as e:
@@ -388,7 +434,7 @@ class SyncClient:
             if not response_data:
                 logger.error(f"文件发送失败: {rel_path}, 未收到服务端响应")
                 continue
-
+                
             try:
                 response = json.loads(response_data)
             except json.JSONDecodeError as e:
@@ -413,7 +459,7 @@ class SyncClient:
             if not response_data:
                 logger.error(f"文件发送状态未知: {rel_path}, 未收到服务端响应")
                 continue
-
+                
             try:
                 response = json.loads(response_data)
             except json.JSONDecodeError as e:
@@ -431,7 +477,7 @@ class SyncClient:
         if not response_data:
             logger.warning("同步完成状态未知: 未收到服务端响应")
             return
-
+            
         try:
             response = json.loads(response_data)
         except json.JSONDecodeError as e:
