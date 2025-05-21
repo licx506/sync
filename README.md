@@ -146,6 +146,47 @@ restorer.close()
 3. 文件修改时间差异超过阈值（默认60秒）
 4. 文件哈希值不同（只有在满足上述条件之一时才会计算哈希值）
 
+## 文件排除功能
+
+系统支持通过配置文件排除特定文件和目录，不将它们包含在同步列表中：
+
+1. 默认排除的文件类型：
+   - 数据库文件（.db, .db-journal）
+   - Python缓存文件（.pyc, .pyo, .pyd）
+   - 日志文件（.log）
+
+2. 默认排除的目录：
+   - Python缓存目录（__pycache__）
+   - 备份目录（backups）
+   - 日志目录（logs）
+   - Git目录（.git）
+
+3. 自定义排除规则：
+   - 编辑`exclude.conf`文件可自定义排除规则
+   - 支持三种排除规则：
+     - `ext:.xxx` - 排除指定扩展名的文件
+     - `dir:dirname` - 排除指定名称的目录
+     - `path:relative/path` - 排除指定的相对路径
+
+### 示例配置文件
+
+```
+# 排除数据库文件
+ext:.db
+ext:.db-journal
+
+# 排除Python缓存文件
+ext:.pyc
+
+# 排除目录
+dir:__pycache__
+dir:.git
+
+# 排除特定路径
+path:sync/file_sync_client.db
+path:sync/server_file_sync.db
+```
+
 ## 注意事项
 
 1. 确保服务端和客户端之间的网络连接正常
