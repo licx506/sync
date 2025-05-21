@@ -1,0 +1,1181 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+文件同步工具
+
+系统启动时扫描上一级文件夹内所有文件，记录文件大小、修改日期到SQLite数据库。
+客户端连接服务端时对比时间差值，下载服务端数据库文件并对比文件清单。
+找出不一致的文件并同步，服务端备份被替换的文件。
+支持按时间段恢复文件功能。
+
+使用方法:
+    服务端模式: python sync_tool.py --server [--port PORT]
+    客户端模式: python sync_tool.py --client --server-ip IP [--port PORT]
+    恢复文件: python sync_tool.py --restore --start-time TIME --end-time TIME
+    交互模式: python sync_tool.py
+"""
+
+import os
+import sys
+import time
+import socket
+import argparse
+import logging
+import json
+import hashlib
+import shutil
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timedelta
+import threading
+import queue
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("sync_tool")
+
+# 默认配置
+DEFAULT_PORT = 8765
+DEFAULT_BUFFER_SIZE = 4096
+DEFAULT_ENCODING = 'utf-8'
+DEFAULT_TIME_THRESHOLD = 60  # 文件修改时间阈值（秒）
+DEFAULT_SIZE_THRESHOLD = 10  # 文件大小阈值（字节）
+
+class FileDatabase:
+    """文件数据库管理类"""
+
+    def __init__(self, db_path=None):
+        """初始化数据库
+
+        Args:
+            db_path: 数据库文件路径，默认为当前目录下的file_sync.db
+        """
+        if db_path is None:
+            self.db_path = Path("file_sync.db")
+        else:
+            self.db_path = Path(db_path)
+
+        self.conn = None
+        self.cursor = None
+
+        # 初始化数据库
+        self.init_db()
+
+    def init_db(self):
+        """初始化数据库"""
+        try:
+            self.conn = sqlite3.connect(self.db_path)
+            self.cursor = self.conn.cursor()
+
+            # 创建文件表
+            self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                modified_time REAL NOT NULL,
+                hash TEXT,
+                last_sync_time REAL,
+                UNIQUE(path)
+            )
+            ''')
+
+            # 创建备份文件表
+            self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backup_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_path TEXT NOT NULL,
+                backup_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                modified_time REAL NOT NULL,
+                backup_time REAL NOT NULL,
+                hash TEXT
+            )
+            ''')
+
+            self.conn.commit()
+            logger.info(f"数据库初始化完成: {self.db_path}")
+        except sqlite3.Error as e:
+            logger.error(f"数据库初始化失败: {str(e)}")
+            if self.conn:
+                self.conn.close()
+            raise
+
+    def close(self):
+        """关闭数据库连接"""
+        if self.conn:
+            self.conn.close()
+            logger.info("数据库连接已关闭")
+
+    def scan_directory(self, directory):
+        """扫描目录并更新数据库
+
+        Args:
+            directory: 要扫描的目录
+
+        Returns:
+            扫描到的文件数量
+        """
+        directory = Path(directory)
+        if not directory.exists() or not directory.is_dir():
+            logger.error(f"目录不存在或不是一个有效的目录: {directory}")
+            return 0
+
+        file_count = 0
+        current_time = time.time()
+
+        try:
+            for root, _, filenames in os.walk(directory):
+                for filename in filenames:
+                    file_path = Path(root) / filename
+                    rel_path = file_path.relative_to(directory)
+
+                    # 获取文件信息
+                    file_size = file_path.stat().st_size
+                    file_mtime = file_path.stat().st_mtime
+
+                    # 更新数据库
+                    self.cursor.execute('''
+                    INSERT OR REPLACE INTO files (path, size, modified_time, last_sync_time)
+                    VALUES (?, ?, ?, ?)
+                    ''', (str(rel_path), file_size, file_mtime, current_time))
+
+                    file_count += 1
+
+            self.conn.commit()
+            logger.info(f"扫描完成，共处理 {file_count} 个文件")
+            return file_count
+        except Exception as e:
+            logger.error(f"扫描目录时发生错误: {str(e)}")
+            self.conn.rollback()
+            return 0
+
+    def get_file_info(self, file_path):
+        """获取文件信息
+
+        Args:
+            file_path: 文件相对路径
+
+        Returns:
+            文件信息字典，如果文件不存在则返回None
+        """
+        try:
+            self.cursor.execute('''
+            SELECT path, size, modified_time, hash, last_sync_time
+            FROM files
+            WHERE path = ?
+            ''', (str(file_path),))
+
+            row = self.cursor.fetchone()
+            if row:
+                return {
+                    'path': row[0],
+                    'size': row[1],
+                    'modified_time': row[2],
+                    'hash': row[3],
+                    'last_sync_time': row[4]
+                }
+            return None
+        except sqlite3.Error as e:
+            logger.error(f"获取文件信息失败: {str(e)}")
+            return None
+
+    def get_all_files(self):
+        """获取所有文件信息
+
+        Returns:
+            文件信息列表
+        """
+        try:
+            self.cursor.execute('''
+            SELECT path, size, modified_time, hash, last_sync_time
+            FROM files
+            ORDER BY path
+            ''')
+
+            files = []
+            for row in self.cursor.fetchall():
+                files.append({
+                    'path': row[0],
+                    'size': row[1],
+                    'modified_time': row[2],
+                    'hash': row[3],
+                    'last_sync_time': row[4]
+                })
+            return files
+        except sqlite3.Error as e:
+            logger.error(f"获取所有文件信息失败: {str(e)}")
+            return []
+
+    def backup_file(self, original_path, backup_path, size, modified_time, hash_value=None):
+        """备份文件记录
+
+        Args:
+            original_path: 原始文件路径
+            backup_path: 备份文件路径
+            size: 文件大小
+            modified_time: 文件修改时间
+            hash_value: 文件哈希值
+
+        Returns:
+            是否成功
+        """
+        try:
+            backup_time = time.time()
+            self.cursor.execute('''
+            INSERT INTO backup_files (original_path, backup_path, size, modified_time, backup_time, hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (str(original_path), str(backup_path), size, modified_time, backup_time, hash_value))
+
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"备份文件记录失败: {str(e)}")
+            self.conn.rollback()
+            return False
+
+    def get_backup_files_by_time_range(self, start_time, end_time):
+        """根据时间范围获取备份文件
+
+        Args:
+            start_time: 开始时间戳
+            end_time: 结束时间戳
+
+        Returns:
+            备份文件列表
+        """
+        try:
+            self.cursor.execute('''
+            SELECT original_path, backup_path, size, modified_time, backup_time, hash
+            FROM backup_files
+            WHERE backup_time BETWEEN ? AND ?
+            ORDER BY backup_time DESC
+            ''', (start_time, end_time))
+
+            backup_files = []
+            for row in self.cursor.fetchall():
+                backup_files.append({
+                    'original_path': row[0],
+                    'backup_path': row[1],
+                    'size': row[2],
+                    'modified_time': row[3],
+                    'backup_time': row[4],
+                    'hash': row[5]
+                })
+            return backup_files
+        except sqlite3.Error as e:
+            logger.error(f"获取备份文件失败: {str(e)}")
+            return []
+
+class SyncServer:
+    """同步服务端"""
+
+    def __init__(self, port=DEFAULT_PORT, log_dir=None):
+        """初始化服务端
+
+        Args:
+            port: 服务端监听端口
+            log_dir: 日志目录，默认为当前目录下的logs文件夹
+        """
+        self.port = port
+
+        # 设置日志目录
+        if log_dir is None:
+            self.log_dir = Path("logs")
+        else:
+            self.log_dir = Path(log_dir)
+
+        # 创建日志目录
+        self.log_dir.mkdir(exist_ok=True)
+
+        # 设置文件日志
+        self.setup_file_logger()
+
+        # 创建socket
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # 客户端连接队列
+        self.clients = queue.Queue()
+
+        # 获取当前脚本所在目录
+        self.script_dir = Path(__file__).resolve().parent
+
+        # 设置备份目录
+        self.backup_dir = self.script_dir / "backups"
+        self.backup_dir.mkdir(exist_ok=True)
+
+        # 初始化数据库
+        self.db = FileDatabase(self.script_dir / "file_sync.db")
+
+        # 扫描上一级目录
+        self.scan_parent_directory()
+
+        logger.info(f"服务端初始化完成，监听端口: {self.port}")
+
+    def scan_parent_directory(self):
+        """扫描上一级目录"""
+        parent_dir = self.script_dir.parent
+        logger.info(f"开始扫描上一级目录: {parent_dir}")
+        file_count = self.db.scan_directory(parent_dir)
+        logger.info(f"扫描完成，共发现 {file_count} 个文件")
+
+    def setup_file_logger(self):
+        """设置文件日志"""
+        log_file = self.log_dir / f"sync_server_{datetime.now().strftime('%Y%m%d')}.log"
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+
+    def start(self):
+        """启动服务端"""
+        try:
+            # 绑定地址和端口
+            self.server_socket.bind(('0.0.0.0', self.port))
+            # 开始监听
+            self.server_socket.listen(5)
+            logger.info(f"服务端已启动，监听地址: 0.0.0.0:{self.port}")
+
+            # 启动客户端处理线程
+            client_handler = threading.Thread(target=self.handle_clients)
+            client_handler.daemon = True
+            client_handler.start()
+
+            # 接受客户端连接
+            while True:
+                client_socket, client_address = self.server_socket.accept()
+                logger.info(f"接受客户端连接: {client_address[0]}:{client_address[1]}")
+                self.clients.put((client_socket, client_address))
+
+        except KeyboardInterrupt:
+            logger.info("接收到中断信号，服务端正在关闭...")
+        except Exception as e:
+            logger.error(f"服务端发生错误: {str(e)}")
+        finally:
+            self.server_socket.close()
+            self.db.close()
+            logger.info("服务端已关闭")
+
+    def handle_clients(self):
+        """处理客户端连接"""
+        while True:
+            try:
+                client_socket, client_address = self.clients.get(timeout=1)
+                threading.Thread(target=self.handle_client, args=(client_socket, client_address)).start()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"处理客户端连接时发生错误: {str(e)}")
+
+    def handle_client(self, client_socket, client_address):
+        """处理单个客户端连接
+
+        Args:
+            client_socket: 客户端socket
+            client_address: 客户端地址
+        """
+        client_ip = client_address[0]
+        try:
+            # 接收客户端请求类型
+            request_data = self.receive_data(client_socket)
+            request = json.loads(request_data)
+
+            request_type = request.get('type')
+
+            if request_type == 'time_sync':
+                # 处理时间同步请求
+                self.handle_time_sync(client_socket, request)
+            elif request_type == 'db_download':
+                # 处理数据库下载请求
+                self.handle_db_download(client_socket)
+            elif request_type == 'file_sync':
+                # 处理文件同步请求
+                self.handle_file_sync(client_socket, client_ip, request)
+            else:
+                logger.warning(f"未知的请求类型: {request_type}")
+                self.send_data(client_socket, json.dumps({"status": "error", "message": "Unknown request type"}))
+
+        except json.JSONDecodeError as e:
+            logger.error(f"解析JSON数据失败: {str(e)}")
+            self.send_data(client_socket, json.dumps({"status": "error", "message": "Invalid JSON data"}))
+        except Exception as e:
+            logger.error(f"处理客户端 {client_ip} 时发生错误: {str(e)}")
+            try:
+                self.send_data(client_socket, json.dumps({"status": "error", "message": str(e)}))
+            except:
+                pass
+        finally:
+            client_socket.close()
+
+    def handle_time_sync(self, client_socket, request):
+        """处理时间同步请求
+
+        Args:
+            client_socket: 客户端socket
+            request: 请求数据
+        """
+        client_time = request.get('client_time')
+        server_time = time.time()
+
+        response = {
+            "status": "ok",
+            "server_time": server_time,
+            "client_time": client_time,
+            "time_diff": server_time - client_time
+        }
+
+        self.send_data(client_socket, json.dumps(response))
+        logger.info(f"时间同步完成，时间差: {server_time - client_time:.2f}秒")
+
+    def handle_db_download(self, client_socket):
+        """处理数据库下载请求
+
+        Args:
+            client_socket: 客户端socket
+        """
+        db_path = self.script_dir / "file_sync.db"
+
+        if not db_path.exists():
+            self.send_data(client_socket, json.dumps({"status": "error", "message": "Database file not found"}))
+            return
+
+        # 发送数据库文件大小
+        file_size = db_path.stat().st_size
+        self.send_data(client_socket, json.dumps({"status": "ok", "size": file_size}))
+
+        # 接收客户端准备就绪信息
+        response_data = self.receive_data(client_socket)
+        response = json.loads(response_data)
+
+        if response.get("status") != "ready":
+            logger.error(f"客户端未准备就绪: {response}")
+            return
+
+        # 发送数据库文件
+        with open(db_path, 'rb') as f:
+            while True:
+                chunk = f.read(DEFAULT_BUFFER_SIZE)
+                if not chunk:
+                    break
+                client_socket.sendall(chunk)
+
+        logger.info(f"数据库文件发送完成，大小: {file_size} 字节")
+
+    def handle_file_sync(self, client_socket, client_ip, request):
+        """处理文件同步请求
+
+        Args:
+            client_socket: 客户端socket
+            client_ip: 客户端IP
+            request: 请求数据
+        """
+        files_to_sync = request.get('files', [])
+        file_count = len(files_to_sync)
+
+        logger.info(f"客户端 {client_ip} 请求同步 {file_count} 个文件")
+
+        # 发送准备就绪信息
+        self.send_data(client_socket, json.dumps({"status": "ready"}))
+
+        # 接收文件
+        received_files = 0
+        parent_dir = self.script_dir.parent
+
+        for file_info in files_to_sync:
+            rel_path = file_info.get('path')
+            file_size = file_info.get('size')
+            file_hash = file_info.get('hash')
+            modified_time = file_info.get('modified_time')
+
+            # 构建完整的目标路径
+            full_dest_path = parent_dir / rel_path
+
+            # 确保目标目录存在
+            full_dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 如果文件已存在，备份它
+            if full_dest_path.exists():
+                # 生成备份文件名
+                backup_filename = f"{full_dest_path.name}_{int(time.time())}"
+                backup_path = self.backup_dir / backup_filename
+
+                # 复制文件到备份目录
+                shutil.copy2(full_dest_path, backup_path)
+
+                # 记录备份信息
+                original_file_stat = full_dest_path.stat()
+                self.db.backup_file(
+                    rel_path,
+                    str(backup_path.relative_to(self.script_dir)),
+                    original_file_stat.st_size,
+                    original_file_stat.st_mtime,
+                    self.calculate_file_hash(full_dest_path)
+                )
+
+                logger.info(f"已备份文件: {rel_path} -> {backup_path}")
+
+            # 发送准备接收文件的信息
+            self.send_data(client_socket, json.dumps({"status": "ready_for_file"}))
+
+            # 接收文件内容
+            with open(full_dest_path, 'wb') as f:
+                received_size = 0
+                while received_size < file_size:
+                    chunk = client_socket.recv(min(DEFAULT_BUFFER_SIZE, file_size - received_size))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received_size += len(chunk)
+
+            # 验证文件哈希
+            received_hash = self.calculate_file_hash(full_dest_path)
+            if received_hash != file_hash:
+                logger.warning(f"文件哈希不匹配: {rel_path}")
+                self.send_data(client_socket, json.dumps({"status": "hash_mismatch"}))
+            else:
+                # 更新文件修改时间
+                os.utime(full_dest_path, (time.time(), modified_time))
+
+                # 更新数据库
+                self.db.cursor.execute('''
+                INSERT OR REPLACE INTO files (path, size, modified_time, hash, last_sync_time)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (rel_path, file_size, modified_time, file_hash, time.time()))
+                self.db.conn.commit()
+
+                self.send_data(client_socket, json.dumps({"status": "file_received"}))
+                received_files += 1
+                logger.info(f"已接收文件 ({received_files}/{file_count}): {rel_path}")
+
+        # 发送同步完成信息
+        self.send_data(client_socket, json.dumps({
+            "status": "sync_complete",
+            "received_files": received_files
+        }))
+
+        logger.info(f"客户端 {client_ip} 同步完成，共接收 {received_files}/{file_count} 个文件")
+
+    def receive_data(self, sock):
+        """接收数据
+
+        Args:
+            sock: socket对象
+
+        Returns:
+            接收到的数据
+        """
+        # 接收数据长度
+        length_data = sock.recv(4)
+        if not length_data:
+            return None
+
+        length = int.from_bytes(length_data, byteorder='big')
+
+        # 接收数据
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(min(DEFAULT_BUFFER_SIZE, length - len(data)))
+            if not chunk:
+                break
+            data += chunk
+
+        return data.decode(DEFAULT_ENCODING)
+
+    def send_data(self, sock, data):
+        """发送数据
+
+        Args:
+            sock: socket对象
+            data: 要发送的数据
+        """
+        data_bytes = data.encode(DEFAULT_ENCODING)
+        length = len(data_bytes)
+
+        # 发送数据长度
+        sock.sendall(length.to_bytes(4, byteorder='big'))
+
+        # 发送数据
+        sock.sendall(data_bytes)
+
+    def calculate_file_hash(self, file_path):
+        """计算文件哈希值
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            文件的MD5哈希值
+        """
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+class SyncClient:
+    """同步客户端"""
+
+    def __init__(self, server_ip, port=DEFAULT_PORT):
+        """初始化客户端
+
+        Args:
+            server_ip: 服务端IP地址
+            port: 服务端端口
+        """
+        self.server_ip = server_ip
+        self.port = port
+
+        # 获取当前脚本所在目录
+        self.script_dir = Path(__file__).resolve().parent
+
+        # 初始化数据库
+        self.db = FileDatabase(self.script_dir / "file_sync_client.db")
+
+        # 时间差值
+        self.time_diff = 0
+
+        # 扫描上一级目录
+        self.scan_parent_directory()
+
+        logger.info(f"客户端初始化完成，服务端地址: {server_ip}:{port}")
+
+    def scan_parent_directory(self):
+        """扫描上一级目录"""
+        parent_dir = self.script_dir.parent
+        logger.info(f"开始扫描上一级目录: {parent_dir}")
+        file_count = self.db.scan_directory(parent_dir)
+        logger.info(f"扫描完成，共发现 {file_count} 个文件")
+
+    def start(self):
+        """启动客户端"""
+        try:
+            # 连接服务端
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect((self.server_ip, self.port))
+            logger.info(f"已连接到服务端: {self.server_ip}:{self.port}")
+
+            # 同步时间
+            self.sync_time(client_socket)
+
+            # 下载服务端数据库
+            server_db_path = self.download_server_db(client_socket)
+
+            if not server_db_path:
+                logger.error("下载服务端数据库失败")
+                return
+
+            # 对比文件清单，找出需要同步的文件
+            files_to_sync = self.compare_files(server_db_path)
+
+            # 同步文件
+            self.sync_files(client_socket, files_to_sync)
+
+        except ConnectionRefusedError:
+            logger.error(f"无法连接到服务端: {self.server_ip}:{self.port}")
+        except json.JSONDecodeError as e:
+            logger.error(f"解析JSON数据失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"同步过程中发生错误: {str(e)}")
+        finally:
+            client_socket.close()
+            self.db.close()
+            logger.info("客户端已关闭")
+
+    def sync_time(self, client_socket):
+        """同步时间
+
+        Args:
+            client_socket: 客户端socket
+
+        Returns:
+            时间差值（服务端时间 - 客户端时间）
+        """
+        # 发送时间同步请求
+        request = {
+            "type": "time_sync",
+            "client_time": time.time()
+        }
+        self.send_data(client_socket, json.dumps(request))
+
+        # 接收服务端响应
+        response_data = self.receive_data(client_socket)
+        response = json.loads(response_data)
+
+        if response.get("status") != "ok":
+            logger.error(f"时间同步失败: {response}")
+            return 0
+
+        self.time_diff = response.get("time_diff", 0)
+        logger.info(f"时间同步完成，时间差: {self.time_diff:.2f}秒")
+        return self.time_diff
+
+    def download_server_db(self, client_socket):
+        """下载服务端数据库
+
+        Args:
+            client_socket: 客户端socket
+
+        Returns:
+            服务端数据库文件路径
+        """
+        # 发送数据库下载请求
+        request = {
+            "type": "db_download"
+        }
+        self.send_data(client_socket, json.dumps(request))
+
+        # 接收服务端响应
+        response_data = self.receive_data(client_socket)
+        response = json.loads(response_data)
+
+        if response.get("status") != "ok":
+            logger.error(f"数据库下载请求失败: {response}")
+            return None
+
+        # 获取数据库文件大小
+        file_size = response.get("size", 0)
+
+        # 发送准备就绪信息
+        self.send_data(client_socket, json.dumps({"status": "ready"}))
+
+        # 接收数据库文件
+        server_db_path = self.script_dir / "server_file_sync.db"
+        with open(server_db_path, 'wb') as f:
+            received_size = 0
+            while received_size < file_size:
+                chunk = client_socket.recv(min(DEFAULT_BUFFER_SIZE, file_size - received_size))
+                if not chunk:
+                    break
+                f.write(chunk)
+                received_size += len(chunk)
+
+        logger.info(f"数据库文件下载完成，大小: {received_size} 字节")
+        return server_db_path
+
+    def compare_files(self, server_db_path):
+        """对比文件清单，找出需要同步的文件
+
+        Args:
+            server_db_path: 服务端数据库文件路径
+
+        Returns:
+            需要同步的文件列表
+        """
+        # 连接服务端数据库
+        server_db = sqlite3.connect(server_db_path)
+        server_cursor = server_db.cursor()
+
+        # 获取服务端文件列表
+        server_cursor.execute('''
+        SELECT path, size, modified_time, hash, last_sync_time
+        FROM files
+        ORDER BY path
+        ''')
+
+        server_files = {}
+        for row in server_cursor.fetchall():
+            server_files[row[0]] = {
+                'path': row[0],
+                'size': row[1],
+                'modified_time': row[2],
+                'hash': row[3],
+                'last_sync_time': row[4]
+            }
+
+        # 获取客户端文件列表
+        client_files = {}
+        for file_info in self.db.get_all_files():
+            client_files[file_info['path']] = file_info
+
+        # 找出需要同步的文件
+        files_to_sync = []
+        parent_dir = self.script_dir.parent
+
+        # 遍历客户端文件
+        for path, client_file in client_files.items():
+            server_file = server_files.get(path)
+
+            # 如果服务端没有该文件，或者文件大小不同，或者修改时间差异超过阈值
+            if (not server_file or
+                abs(client_file['size'] - server_file['size']) > DEFAULT_SIZE_THRESHOLD or
+                abs(client_file['modified_time'] - server_file['modified_time']) > DEFAULT_TIME_THRESHOLD):
+
+                # 计算文件哈希
+                full_path = parent_dir / path
+                if full_path.exists():
+                    file_hash = self.calculate_file_hash(full_path)
+                    file_size = full_path.stat().st_size
+                    file_mtime = full_path.stat().st_mtime
+
+                    # 如果服务端有该文件，且哈希值相同，则不需要同步
+                    if server_file and server_file['hash'] == file_hash:
+                        continue
+
+                    files_to_sync.append({
+                        'path': path,
+                        'size': file_size,
+                        'modified_time': file_mtime,
+                        'hash': file_hash
+                    })
+
+        server_db.close()
+        logger.info(f"文件对比完成，需要同步 {len(files_to_sync)} 个文件")
+        return files_to_sync
+
+    def sync_files(self, client_socket, files_to_sync):
+        """同步文件
+
+        Args:
+            client_socket: 客户端socket
+            files_to_sync: 需要同步的文件列表
+        """
+        if not files_to_sync:
+            logger.info("没有文件需要同步")
+            return
+
+        # 发送文件同步请求
+        request = {
+            "type": "file_sync",
+            "files": files_to_sync
+        }
+        self.send_data(client_socket, json.dumps(request))
+
+        # 接收服务端准备就绪信息
+        response_data = self.receive_data(client_socket)
+        response = json.loads(response_data)
+
+        if response.get("status") != "ready":
+            logger.error(f"服务端未准备就绪: {response}")
+            return
+
+        # 发送文件
+        sent_files = 0
+        file_count = len(files_to_sync)
+        parent_dir = self.script_dir.parent
+
+        for file_info in files_to_sync:
+            rel_path = file_info['path']
+            file_size = file_info['size']
+            file_hash = file_info['hash']
+
+            # 接收服务端准备接收文件的信息
+            response_data = self.receive_data(client_socket)
+            response = json.loads(response_data)
+
+            if response.get("status") != "ready_for_file":
+                logger.error(f"服务端未准备接收文件: {response}")
+                continue
+
+            # 发送文件内容
+            full_path = parent_dir / rel_path
+            with open(full_path, 'rb') as f:
+                while True:
+                    chunk = f.read(DEFAULT_BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    client_socket.sendall(chunk)
+
+            # 接收文件接收状态
+            response_data = self.receive_data(client_socket)
+            response = json.loads(response_data)
+
+            if response.get("status") == "file_received":
+                sent_files += 1
+                logger.info(f"已发送文件 ({sent_files}/{file_count}): {rel_path}")
+            else:
+                logger.warning(f"文件发送失败: {rel_path}, 状态: {response.get('status')}")
+
+        # 接收同步完成信息
+        response_data = self.receive_data(client_socket)
+        response = json.loads(response_data)
+
+        if response.get("status") == "sync_complete":
+            received_files = response.get("received_files", 0)
+            logger.info(f"同步完成，服务端成功接收 {received_files}/{file_count} 个文件")
+        else:
+            logger.warning(f"同步未正常完成: {response}")
+
+    def receive_data(self, sock):
+        """接收数据
+
+        Args:
+            sock: socket对象
+
+        Returns:
+            接收到的数据
+        """
+        # 接收数据长度
+        length_data = sock.recv(4)
+        if not length_data:
+            return None
+
+        length = int.from_bytes(length_data, byteorder='big')
+
+        # 接收数据
+        data = b''
+        while len(data) < length:
+            chunk = sock.recv(min(DEFAULT_BUFFER_SIZE, length - len(data)))
+            if not chunk:
+                break
+            data += chunk
+
+        return data.decode(DEFAULT_ENCODING)
+
+    def send_data(self, sock, data):
+        """发送数据
+
+        Args:
+            sock: socket对象
+            data: 要发送的数据
+        """
+        data_bytes = data.encode(DEFAULT_ENCODING)
+        length = len(data_bytes)
+
+        # 发送数据长度
+        sock.sendall(length.to_bytes(4, byteorder='big'))
+
+        # 发送数据
+        sock.sendall(data_bytes)
+
+    def calculate_file_hash(self, file_path):
+        """计算文件哈希值
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            文件的MD5哈希值
+        """
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+
+class FileRestorer:
+    """文件恢复工具"""
+
+    def __init__(self):
+        """初始化恢复工具"""
+        # 获取当前脚本所在目录
+        self.script_dir = Path(__file__).resolve().parent
+
+        # 初始化数据库
+        self.db = FileDatabase(self.script_dir / "file_sync.db")
+
+        # 设置备份目录
+        self.backup_dir = self.script_dir / "backups"
+
+        logger.info("文件恢复工具初始化完成")
+
+    def restore_files_by_time_range(self, start_time, end_time):
+        """根据时间范围恢复文件
+
+        Args:
+            start_time: 开始时间戳
+            end_time: 结束时间戳
+
+        Returns:
+            恢复的文件数量
+        """
+        # 获取备份文件列表
+        backup_files = self.db.get_backup_files_by_time_range(start_time, end_time)
+
+        if not backup_files:
+            logger.info(f"在指定时间范围内没有找到备份文件: {datetime.fromtimestamp(start_time)} - {datetime.fromtimestamp(end_time)}")
+            return 0
+
+        logger.info(f"找到 {len(backup_files)} 个备份文件")
+
+        # 按原始路径分组，只保留每个路径最新的备份
+        latest_backups = {}
+        for backup in backup_files:
+            original_path = backup['original_path']
+            if original_path not in latest_backups or backup['backup_time'] > latest_backups[original_path]['backup_time']:
+                latest_backups[original_path] = backup
+
+        # 恢复文件
+        restored_count = 0
+        parent_dir = self.script_dir.parent
+
+        for original_path, backup in latest_backups.items():
+            # 构建完整的目标路径
+            full_dest_path = parent_dir / original_path
+
+            # 构建完整的备份文件路径
+            backup_path = self.script_dir / backup['backup_path']
+
+            if not backup_path.exists():
+                logger.warning(f"备份文件不存在: {backup_path}")
+                continue
+
+            # 确保目标目录存在
+            full_dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # 复制备份文件到原始位置
+                shutil.copy2(backup_path, full_dest_path)
+
+                # 恢复文件修改时间
+                os.utime(full_dest_path, (time.time(), backup['modified_time']))
+
+                # 更新数据库
+                self.db.cursor.execute('''
+                INSERT OR REPLACE INTO files (path, size, modified_time, hash, last_sync_time)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (original_path, backup['size'], backup['modified_time'], backup['hash'], time.time()))
+
+                restored_count += 1
+                logger.info(f"已恢复文件 ({restored_count}/{len(latest_backups)}): {original_path}")
+            except Exception as e:
+                logger.error(f"恢复文件失败: {original_path}, 错误: {str(e)}")
+
+        self.db.conn.commit()
+        logger.info(f"文件恢复完成，共恢复 {restored_count} 个文件")
+        return restored_count
+
+    def close(self):
+        """关闭恢复工具"""
+        self.db.close()
+        logger.info("文件恢复工具已关闭")
+
+def show_menu():
+    """显示菜单"""
+    print("\n文件同步工具")
+    print("=" * 30)
+    print("1. 启动服务端")
+    print("2. 启动客户端")
+    print("3. 恢复文件")
+    print("0. 退出")
+    print("=" * 30)
+
+    choice = input("请选择: ")
+    return choice
+
+def start_server_interactive():
+    """交互式启动服务端"""
+    port = input("请输入服务端端口 (默认 8765): ")
+    if not port:
+        port = DEFAULT_PORT
+    else:
+        port = int(port)
+
+    log_dir = input("请输入日志目录 (默认 ./logs): ")
+    if not log_dir:
+        log_dir = None
+
+    server = SyncServer(port=port, log_dir=log_dir)
+    server.start()
+
+def start_client_interactive():
+    """交互式启动客户端"""
+    server_ip = input("请输入服务端IP地址: ")
+    while not server_ip:
+        print("服务端IP地址不能为空")
+        server_ip = input("请输入服务端IP地址: ")
+
+    port = input("请输入服务端端口 (默认 8765): ")
+    if not port:
+        port = DEFAULT_PORT
+    else:
+        port = int(port)
+
+    client = SyncClient(server_ip=server_ip, port=port)
+    client.start()
+
+def restore_files_interactive():
+    """交互式恢复文件"""
+    print("\n文件恢复")
+    print("=" * 30)
+    print("请选择恢复方式:")
+    print("1. 按时间范围恢复")
+    print("0. 返回")
+
+    choice = input("请选择: ")
+
+    if choice == "1":
+        # 按时间范围恢复
+        start_time_str = input("请输入开始时间 (格式: YYYY-MM-DD HH:MM:SS): ")
+        end_time_str = input("请输入结束时间 (格式: YYYY-MM-DD HH:MM:SS): ")
+
+        try:
+            start_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S").timestamp()
+            end_time = datetime.strptime(end_time_str, "%Y-%m-%d %H:%M:%S").timestamp()
+
+            restorer = FileRestorer()
+            restorer.restore_files_by_time_range(start_time, end_time)
+            restorer.close()
+        except ValueError:
+            print("时间格式错误，请使用 YYYY-MM-DD HH:MM:SS 格式")
+    elif choice == "0":
+        return
+    else:
+        print("无效的选择")
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(description="文件同步工具")
+    parser.add_argument("--server", action="store_true", help="启动服务端")
+    parser.add_argument("--client", action="store_true", help="启动客户端")
+    parser.add_argument("--restore", action="store_true", help="恢复文件")
+    parser.add_argument("--server-ip", help="服务端IP地址")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="服务端端口")
+    parser.add_argument("--log-dir", help="日志目录")
+    parser.add_argument("--start-time", help="恢复文件的开始时间 (格式: YYYY-MM-DD HH:MM:SS)")
+    parser.add_argument("--end-time", help="恢复文件的结束时间 (格式: YYYY-MM-DD HH:MM:SS)")
+
+    args = parser.parse_args()
+
+    # 通过命令行参数启动
+    if args.server:
+        server = SyncServer(port=args.port, log_dir=args.log_dir)
+        server.start()
+    elif args.client:
+        if not args.server_ip:
+            print("客户端模式需要指定服务端IP地址")
+            return
+
+        client = SyncClient(server_ip=args.server_ip, port=args.port)
+        client.start()
+    elif args.restore:
+        if not args.start_time or not args.end_time:
+            print("恢复文件需要指定开始时间和结束时间")
+            return
+
+        try:
+            start_time = datetime.strptime(args.start_time, "%Y-%m-%d %H:%M:%S").timestamp()
+            end_time = datetime.strptime(args.end_time, "%Y-%m-%d %H:%M:%S").timestamp()
+
+            restorer = FileRestorer()
+            restorer.restore_files_by_time_range(start_time, end_time)
+            restorer.close()
+        except ValueError:
+            print("时间格式错误，请使用 YYYY-MM-DD HH:MM:SS 格式")
+    else:
+        # 交互式菜单
+        while True:
+            choice = show_menu()
+
+            if choice == "1":
+                start_server_interactive()
+                break
+            elif choice == "2":
+                start_client_interactive()
+                break
+            elif choice == "3":
+                restore_files_interactive()
+            elif choice == "0":
+                print("再见!")
+                break
+            else:
+                print("无效的选择，请重试")
+
+if __name__ == "__main__":
+    main()
